@@ -11,6 +11,7 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include "freertos/event_groups.h"
 
 #include "driver/uart.h"
@@ -22,15 +23,15 @@
 #include "lwip/netdb.h"
 #include "lwip/dns.h"
 
-static const int RX_BUF_SIZE = 1024;
+static const int BUF_SIZE = 1024;
 #define LED_PIN 2
 
 #define TXD_PIN (GPIO_NUM_17)
 #define RXD_PIN (GPIO_NUM_16)
-#define RTS_PIN (UART_PIN_NO_CHANGE) //(GPIO_NUM_4)
-#define CTS_PIN (UART_PIN_NO_CHANGE) //(GPIO_NUM_5)
+#define RTS_PIN (GPIO_NUM_4) //(UART_PIN_NO_CHANGE) //(GPIO_NUM_4)
+#define CTS_PIN (GPIO_NUM_5) //(UART_PIN_NO_CHANGE) //(GPIO_NUM_5)
 
-#define BAUD_RATE 9600
+#define BAUD_RATE 57600
 // #define BAUD_RATE 1200
 
 #define OK "\r\nOK\r\n"
@@ -45,6 +46,7 @@ static const int RX_BUF_SIZE = 1024;
 #define WIFI_MAXIMUM_RETRY 5
 
 static EventGroupHandle_t s_wifi_event_group;
+static QueueHandle_t uart_queue;
 
 #define WIFI_CONNECTED_BIT        BIT0
 #define WIFI_FAIL_BIT             BIT1
@@ -133,18 +135,9 @@ esp_err_t wifi_init_sta(void)
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT,
-                                                        ESP_EVENT_ANY_ID,
-                                                        &event_handler,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &event_handler,
-                                                        NULL));
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT,
-                                                        IP_EVENT_STA_GOT_IP,
-                                                        &set_socket,
-                                                        NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &set_socket, NULL));
 
     wifi_config_t wifi_config = {
         .sta = {
@@ -188,45 +181,31 @@ void init_serial(void) {
         .data_bits = UART_DATA_8_BITS,
         .parity = UART_PARITY_DISABLE,
         .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .flow_ctrl = UART_HW_FLOWCTRL_CTS,
         .source_clk = UART_SCLK_DEFAULT,
     };
-    uart_driver_install(UART_NUM_1, RX_BUF_SIZE * 3, RX_BUF_SIZE * 3, 0, NULL, 0);
+    uart_driver_install(UART_NUM_1, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart_queue, 0);
     uart_param_config(UART_NUM_1, &uart_config);
     uart_set_pin(UART_NUM_1, TXD_PIN, RXD_PIN, RTS_PIN, CTS_PIN);
+    uart_disable_tx_intr(UART_NUM_1);
+    uart_enable_pattern_det_baud_intr(UART_NUM_1, '\r', 1, 9, 0, 0);
+    uart_pattern_queue_reset(UART_NUM_1, 20);
 }
 
 int sendData(const char* logName, const char* data)
 {
     const int len = strlen(data);
-    // vTaskDelay(100 / portTICK_PERIOD_MS);
-    // const int txBytes = uart_write_bytes_with_break(UART_NUM_1, data, len, 10);
-    // const int txBytes = uart_write_bytes(UART_NUM_1, data, len);
     const int txBytes = uart_tx_chars(UART_NUM_1, data, len);
     ESP_ERROR_CHECK(uart_wait_tx_done(UART_NUM_1, 20));
-    // ESP_LOGI(logName, "Wrote %d bytes", txBytes);
     ESP_LOG_BUFFER_HEXDUMP(logName, data, txBytes, ESP_LOG_WARN);
     return txBytes;
 }
 
-// static void tx_task(void *arg)
-// {
-//     static const char *TX_TASK_TAG = "TX_TASK";
-//     esp_log_level_set(TX_TASK_TAG, ESP_LOG_INFO);
-//     while (1) {
-//         if(!QUIET){
-//             sendData(TX_TASK_TAG, "OK\n");
-//         }
-//         vTaskDelay(100 / portTICK_PERIOD_MS);
-//     }
-// }
-
 static void tcp_tx_task(void *arg)
 {
-    char rx_buffer[128] = {0};
+    char rx_buffer[1024] = {0};
     int rxBytes;
     int txBytes;
-    // uint8_t* data = (uint8_t*) malloc(RX_BUF_SIZE+1);
     EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group,
         SOCKET_CONNECTED_BIT,
         pdFALSE,
@@ -236,13 +215,10 @@ static void tcp_tx_task(void *arg)
         txBytes = 0;
         for(;;){
             rxBytes = recv(sock, rx_buffer, sizeof(rx_buffer) - 1, MSG_WAITALL);
-            // const int rxBytes = read(sock, rx_buffer, sizeof(rx_buffer)-1);
             while (rxBytes > txBytes) {
-                // ESP_LOGI(TCP_TAG, "rxbytes: %d txBytes: %d", rxBytes, txBytes);
-                txBytes = uart_write_bytes(UART_NUM_1, rx_buffer, rxBytes);
-                // ESP_LOGI(TCP_TAG, "rxbytes: %d txBytes: %d", rxBytes, txBytes);
+                txBytes = uart_tx_chars(UART_NUM_1, rx_buffer, rxBytes);
+                ESP_ERROR_CHECK(uart_wait_tx_done(UART_NUM_1, 20));
                 rxBytes = rxBytes - txBytes;
-                // ESP_LOGI(TCP_TAG, "rxbytes: %d txBytes: %d", rxBytes, txBytes);
                 ESP_LOG_BUFFER_HEXDUMP(TCP_TAG, rx_buffer, txBytes, ESP_LOG_WARN);
             }
             bzero(rx_buffer, sizeof(rx_buffer));
@@ -252,75 +228,120 @@ static void tcp_tx_task(void *arg)
     }
 }
 
+static esp_err_t dce_modem() {
+    int pos = uart_pattern_pop_pos(UART_NUM_1);
+    if (pos == -1) {
+        ESP_LOGW(MODEM_TAG, "Pattern Queue Size too small");
+        uart_flush_input(UART_NUM_1);
+    } else {
+        uint8_t* data = (uint8_t*) malloc(BUF_SIZE);
+        int read_len = uart_read_bytes(UART_NUM_1, data, pos + 1, 50 / portTICK_PERIOD_MS);
+        ESP_LOG_BUFFER_HEXDUMP(MODEM_TAG, data, read_len, ESP_LOG_INFO);
+        int start;
+        if ( data[0] == 'A' && data[1] == 'T' ) {
+            start = 2;
+        }
+        if ( data[0] == 0x00 && data[1] == 'A' && data[2] == 'T' ) {
+            start = 3;
+        }
+        if ( data[0] == '+' && data[1] == '+' && data[2] == '+' ) {
+            xEventGroupClearBits(s_wifi_event_group, MODEM_CONNECTED_BIT);
+            vTaskDelay(50);
+        }
+        for (int i = start; i < read_len; i++) {
+            if ( data[i] >= 'A' && data[i] <= 'Z' ) {
+                if ( data[i] == 'D'){
+                    ESP_ERROR_CHECK(wifi_init_sta());
+                    // Wait a but for a manual socat (re)start
+                    vTaskDelay(1000);
+                    sendData(MODEM_TAG, CONN);
+                    xEventGroupSetBits(s_wifi_event_group, MODEM_CONNECTED_BIT);
+                    i++;
+                    while (data[i] >= '0' && data[i] <= '9' ) {
+                        i++;
+                    }
+                }
+                if ( data[i] == 'V' || data[i] == 'H' || data[i] == 'Q' || data[i] == 'E' || data[i] == 'Z' || data[i] == 'L' ) {
+                    sendData(MODEM_TAG, OK);
+                    if ( data[i+1] >= '0' && data[i+1] <= '9') {
+                        i++;
+                    }
+                }
+                if ( data[i] == 'S'){
+                    sendData(MODEM_TAG, OK);
+                    while ( (data[i+1] >= '0' && data[i+1] <= '9' ) ||  data[i+1] == '=') {
+                        i++;
+                    }
+                }
+            }
+            if (data[i] == '&') {
+                sendData(MODEM_TAG, OK);
+                i = (i + 2);
+            }
+        }
+    }
+    return ESP_OK;
+}
+
 static void serial_rx_task(void *arg)
 {
-    static const char *RX_TASK_TAG = "RX_TASK";
-    static const char *REPLY_TAG = "TX_REPL";
-    esp_log_level_set(RX_TASK_TAG, ESP_LOG_INFO);
-    // uint8_t* data = (uint8_t*) malloc(RX_BUF_SIZE+1);
-    char data[128] = {0};
+    static const char *RX_TASK_TAG = "SERIAL_RX_TASK";
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(BUF_SIZE);
+    size_t buffered_size;
     EventBits_t bits;
-    int length = 0;
-    int rxBytes;
+    /// Always ready to send
+    uart_set_rts(UART_NUM_1,1);
     while (1) {
-        ESP_ERROR_CHECK(uart_get_buffered_data_len(UART_NUM_1, (size_t*)&length));
-        bits = xEventGroupGetBits(s_wifi_event_group);
-        rxBytes = uart_read_bytes(UART_NUM_1, data, RX_BUF_SIZE, 50 / portTICK_PERIOD_MS);
-        if (rxBytes > 0) {
-            if (!(bits & MODEM_CONNECTED_BIT) != 0) {
-                data[rxBytes] = 0;
-                // ESP_LOGI(RX_TASK_TAG, "Read %d bytes: '%s'", rxBytes, data);
-                ESP_LOG_BUFFER_HEXDUMP(RX_TASK_TAG, data, rxBytes, ESP_LOG_INFO);
-                int start;
-                if ( data[0] == 'A' && data[1] == 'T' ) {
-                    start = 2;
-                }
-                if ( data[1] == 0x00 && data[1] == 'A' && data[2] == 'T' ) {
-                    start = 3;
-                }
-                if ( data[1] == '+' && data[1] == '+' && data[2] == '+' ) {
-                    vTaskDelay(50);
-                }
-
-                for (int i = start; i < rxBytes; i++) {
-                    if ( data[i] >= 'A' && data[i] <= 'Z' ) {
-                        if ( data[i] == 'D'){
-                            ESP_ERROR_CHECK(wifi_init_sta());
-                            vTaskDelay(1000);
-                            sendData(REPLY_TAG, CONN);
-                            xEventGroupSetBits(s_wifi_event_group, MODEM_CONNECTED_BIT);
-                            i++;
-                            while (data[i] >= '0' && data[i] <= '9' ) {
-                                i++;
-                            }
-                        }
-                        if ( data[i] == 'V' || data[i] == 'H' || data[i] == 'Q' || data[i] == 'E' || data[i] == 'Z' || data[i] == 'L' ) {
-                            sendData(REPLY_TAG, OK);
-                            if ( data[i+1] >= '0' && data[i+1] <= '9') {
-                                i++;
-                            }
-                        }
-                        if ( data[i] == 'S'){
-                            sendData(REPLY_TAG, OK);
-                            while ( (data[i+1] >= '0' && data[i+1] <= '9' ) ||  data[i+1] == '=') {
-                                i++;
-                            }
-                        }
+        if (xQueueReceive(uart_queue, (void *)&event, 50 / portTICK_PERIOD_MS)) {
+            switch (event.type) {
+                case UART_DATA:
+                    bits = xEventGroupGetBits(s_wifi_event_group);
+                    if (!(bits & MODEM_CONNECTED_BIT) == 0) {
+                        uart_get_buffered_data_len(UART_NUM_1, &buffered_size);
+                        int read_bytes = uart_read_bytes(UART_NUM_1, data, buffered_size, portMAX_DELAY);
+                        write(sock, data, read_bytes);
                     }
-
-                    if (data[i] == '&') {
-                        sendData(REPLY_TAG, OK);
-                        i = (i + 2);
+                    break;
+                case UART_FIFO_OVF:
+                    ESP_LOGW(RX_TASK_TAG, "HW FIFO Overflow");
+                    uart_flush(UART_NUM_1);
+                    xQueueReset(uart_queue);
+                    break;
+                case UART_BUFFER_FULL:
+                    ESP_LOGW(RX_TASK_TAG, "Ring Buffer Full");
+                    uart_flush(UART_NUM_1);
+                    xQueueReset(uart_queue);
+                    break;
+                case UART_BREAK:
+                    ESP_LOGW(RX_TASK_TAG, "Rx Break");
+                    break;
+                case UART_PARITY_ERR:
+                    ESP_LOGE(RX_TASK_TAG, "Parity Error");
+                    break;
+                case UART_FRAME_ERR:
+                    ESP_LOGE(RX_TASK_TAG, "Frame Error");
+                    break;
+                case UART_PATTERN_DET:
+                    bits = xEventGroupGetBits(s_wifi_event_group);
+                    if (!(bits & MODEM_CONNECTED_BIT) != 0) {
+                        ESP_ERROR_CHECK(dce_modem());
+                    } else {
+                        ESP_LOGW(RX_TASK_TAG, "Unexpected pattern detected after modem is connected");
                     }
-                }
-            } else {
-                ESP_LOG_BUFFER_HEXDUMP(MODEM_TAG, data, rxBytes, ESP_LOG_INFO);
-                write(sock , data , rxBytes);
-                bzero(data, sizeof(data));
+                    break;
+                default:
+                    uint8_t* data = (uint8_t*) malloc(BUF_SIZE);
+                    ESP_LOGI(RX_TASK_TAG, "[UART DATA]: %d", event.size);
+                    uart_read_bytes(UART_NUM_1, data, event.size, portMAX_DELAY);
+                    ESP_LOGI(RX_TASK_TAG, "[DATA EVT]: %s", data);
+                    break;
             }
         }
     }
     free(data);
+    data= NULL;
+    vTaskDelete(NULL);
 }
 
 void app_main(void)
@@ -341,17 +362,6 @@ void app_main(void)
     s_wifi_event_group = xEventGroupCreate();
 
     init_serial();
-    xTaskCreate(serial_rx_task, "uart_rx_task", 1024*3, NULL, configMAX_PRIORITIES, NULL);
-    xTaskCreate(tcp_tx_task, "tcp_tx_task", 1024*3, NULL, configMAX_PRIORITIES, NULL);
+    xTaskCreate(serial_rx_task, "uart_rx_task", 1024*5, NULL, 12, NULL);
+    xTaskCreate(tcp_tx_task, "tcp_tx_task", 1024*5, NULL, configMAX_PRIORITIES, NULL);
 }
-
-// AT
-// Q0 quiet disable
-// E0 Echo disable
-// &D0 DTR drop is interpreted according to the current &Qn setting as follows
-// &C1 RLSD follows the state of the carrier. (Default.)
-// V1 Verbose Enable
-// S7=70 Wait Time for Carrier, Silence, or Dial Tone (50 Seconds)
-// S6=4  Wait Time before Blind Dialing or for Dial Tone (2 Seconds)
-// L3   Speaker Volume (0,1 low, 2 med, 3 high)
-// DT00 Dial and Select tone dialing: tone dial the numbers that follow until a "P" is encountered. Affects current and subsequent dialing
